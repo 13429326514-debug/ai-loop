@@ -1,3 +1,5 @@
 logs/
+projects/
 .prompt.tmp
 *.tmp
+.idea/

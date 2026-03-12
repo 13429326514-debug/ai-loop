@@ -30,9 +30,15 @@ if [[ -z "${CLAUDE_CODE_GIT_BASH_PATH:-}" ]]; then
 fi
 
 DRY_RUN=false
-if [[ "${1:-}" == "--dry-run" ]]; then
-  DRY_RUN=true
-fi
+INTERACTIVE=false
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dry-run)      DRY_RUN=true ;;
+    --interactive)  INTERACTIVE=true ;;
+  esac
+  shift
+done
 
 # ------------------------------------------------------------------------------
 # Logging helpers
@@ -60,6 +66,7 @@ init() {
   log "=== AI Auto-Loop System Starting ==="
   log "Script dir: $SCRIPT_DIR"
   log "Dry-run mode: $DRY_RUN"
+  log "Interactive mode: $INTERACTIVE"
 
   # Check jq
   if ! command -v jq &>/dev/null; then
@@ -126,8 +133,121 @@ read_config() {
   MAX_RETRIES=$(jq -r '.config.max_retries // 2' "$TASK_FILE")
   TIMEOUT_SECONDS=$(jq -r '.config.timeout_seconds // 300' "$TASK_FILE")
   MAX_BUDGET_USD=$(jq -r '.config.max_budget_usd // 1.0' "$TASK_FILE")
+  PROJECT_NAME=$(jq -r '.project_name // ""' "$TASK_FILE")
 
+  if [[ -z "$PROJECT_NAME" ]]; then
+    log_error "project_name is required in task.json"
+    exit 1
+  fi
+
+  PROJECT_DIR="$PROJECTS_DIR/$PROJECT_NAME"
   log "Config: max_retries=$MAX_RETRIES, timeout=${TIMEOUT_SECONDS}s, budget=\$${MAX_BUDGET_USD}"
+  log "Project: $PROJECT_NAME"
+}
+
+# ------------------------------------------------------------------------------
+# Initialize GitHub remote repository and local git for the project
+# ------------------------------------------------------------------------------
+init_git_repo() {
+  if [[ "$DRY_RUN" == true ]]; then
+    log "[DRY-RUN] Would create GitHub repo: $PROJECT_NAME"
+    return 0
+  fi
+
+  mkdir -p "$PROJECT_DIR"
+
+  # Check if already a git repo with remote
+  if [[ -d "$PROJECT_DIR/.git" ]]; then
+    local has_remote
+    has_remote=$(cd "$PROJECT_DIR" && git remote -v 2>/dev/null | grep -c origin || true)
+    if [[ "$has_remote" -gt 0 ]]; then
+      log "Git repo already initialized with remote for $PROJECT_NAME"
+      return 0
+    fi
+  fi
+
+  # Check gh CLI
+  if ! command -v gh &>/dev/null; then
+    log_error "gh (GitHub CLI) is not installed. Required for creating remote repos."
+    exit 1
+  fi
+
+  # Get GitHub username
+  local gh_user
+  gh_user=$(gh api user --jq '.login' 2>/dev/null)
+  if [[ -z "$gh_user" ]]; then
+    log_error "Failed to get GitHub username. Run 'gh auth login' first."
+    exit 1
+  fi
+  log "GitHub user: $gh_user"
+
+  # Create remote repo if not exists
+  if ! gh repo view "$gh_user/$PROJECT_NAME" &>/dev/null; then
+    log "Creating private GitHub repo: $gh_user/$PROJECT_NAME"
+    gh repo create "$PROJECT_NAME" --private --confirm 2>/dev/null || \
+    gh repo create "$PROJECT_NAME" --private 2>/dev/null
+    log "GitHub repo created: $gh_user/$PROJECT_NAME"
+  else
+    log "GitHub repo already exists: $gh_user/$PROJECT_NAME"
+  fi
+
+  # Init local git repo
+  cd "$PROJECT_DIR"
+  if [[ ! -d ".git" ]]; then
+    git init
+    log "Local git repo initialized in $PROJECT_DIR"
+  fi
+
+  # Set remote
+  local remote_url="https://github.com/$gh_user/$PROJECT_NAME.git"
+  if ! git remote get-url origin &>/dev/null; then
+    git remote add origin "$remote_url"
+    log "Remote origin set to: $remote_url"
+  fi
+
+  cd "$SCRIPT_DIR"
+}
+
+# ------------------------------------------------------------------------------
+# Commit and push after a successful task
+# ------------------------------------------------------------------------------
+git_commit_and_push() {
+  local task_id="$1"
+  local task_title="$2"
+
+  if [[ "$DRY_RUN" == true ]]; then
+    log "[DRY-RUN] Would commit and push for $task_id"
+    return 0
+  fi
+
+  cd "$PROJECT_DIR"
+
+  # Check if there are changes to commit
+  if [[ -z "$(git status --porcelain 2>/dev/null)" ]]; then
+    log "No changes to commit for $task_id"
+    cd "$SCRIPT_DIR"
+    return 0
+  fi
+
+  git add -A
+  git commit -m "feat($task_id): $task_title"
+  log "Committed: feat($task_id): $task_title"
+
+  # Push (create main branch on first push if needed)
+  local current_branch
+  current_branch=$(git branch --show-current 2>/dev/null || echo "main")
+  if [[ -z "$current_branch" ]]; then
+    current_branch="main"
+    git checkout -b main
+  fi
+
+  git push -u origin "$current_branch" 2>&1 || {
+    log "Push failed, retrying..."
+    git push --set-upstream origin "$current_branch" 2>&1
+  }
+  log "Pushed to origin/$current_branch"
+
+  cd "$SCRIPT_DIR"
 }
 
 # ------------------------------------------------------------------------------
@@ -265,15 +385,34 @@ execute_task() {
       local prompt_tmp="$SCRIPT_DIR/.prompt.tmp"
       printf '%s' "$task_prompt" > "$prompt_tmp"
 
-      # Execute claude in projects/ directory (tee to both terminal and log file)
-      set +e
-      timeout "$TIMEOUT_SECONDS" claude -p "$(cat "$prompt_tmp")" \
-        --dangerously-skip-permissions \
-        --max-budget-usd "$MAX_BUDGET_USD" \
-        --no-session-persistence \
-        2>&1 <<< "" | tee "$output_file"
-      exit_code=${PIPESTATUS[0]}
-      set -e
+      if [[ "$INTERACTIVE" == true ]]; then
+        # Interactive mode: open native Claude Code session
+        log "[INTERACTIVE] Starting Claude Code for $task_id — exit with /exit when done"
+        echo ""
+        echo "========================================"
+        echo "  Task: $task_id ($task_title)"
+        echo "  Mode: Interactive — you can chat, modify, give feedback"
+        echo "  Exit: type /exit when you are done"
+        echo "========================================"
+        echo ""
+
+        set +e
+        claude --init-prompt "$(cat "$prompt_tmp")" \
+          --dangerously-skip-permissions \
+          --max-budget-usd "$MAX_BUDGET_USD"
+        exit_code=$?
+        set -e
+      else
+        # Auto mode: non-interactive execution (tee to both terminal and log file)
+        set +e
+        timeout "$TIMEOUT_SECONDS" claude -p "$(cat "$prompt_tmp")" \
+          --dangerously-skip-permissions \
+          --max-budget-usd "$MAX_BUDGET_USD" \
+          --no-session-persistence \
+          2>&1 <<< "" | tee "$output_file"
+        exit_code=${PIPESTATUS[0]}
+        set -e
+      fi
 
       # Clean up temp file
       rm -f "$prompt_tmp"
@@ -352,6 +491,7 @@ print_summary() {
 main() {
   init
   read_config
+  init_git_repo
 
   local task_count
   task_count=$(jq '.tasks | length' "$TASK_FILE")
@@ -389,12 +529,32 @@ main() {
       found=true
 
       # Execute the task (failures don't stop the loop)
+      local task_result=0
       if [[ "$DRY_RUN" == true ]]; then
-        execute_task "$task_id" "$task_title" "$task_prompt" || true
+        execute_task "$task_id" "$task_title" "$task_prompt" || task_result=$?
       else
-        cd "$PROJECTS_DIR"
-        execute_task "$task_id" "$task_title" "$task_prompt" || true
+        cd "$PROJECT_DIR"
+        execute_task "$task_id" "$task_title" "$task_prompt" || task_result=$?
         cd "$SCRIPT_DIR"
+      fi
+
+      # Commit and push on success
+      if [[ $task_result -eq 0 ]]; then
+        git_commit_and_push "$task_id" "$task_title"
+      fi
+
+      # In interactive mode, prompt user before next task
+      if [[ "$INTERACTIVE" == true && "$DRY_RUN" == false ]]; then
+        echo ""
+        echo "========================================"
+        echo "  Task $task_id finished."
+        echo "  Press Enter to continue next task, or q to quit."
+        echo "========================================"
+        read -r user_input
+        if [[ "$user_input" == "q" || "$user_input" == "Q" ]]; then
+          log "User chose to quit after $task_id"
+          break 2  # break both for and while loops
+        fi
       fi
 
       # Break inner for-loop to re-check completed list from the top
