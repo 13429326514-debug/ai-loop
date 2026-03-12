@@ -8,8 +8,28 @@
   "tasks": [
     {
       "id": "task-001",
-      "title": "创建 hello-world 示例项目",
-      "prompt": "在 hello-world/ 目录下创建一个 Node.js 项目：\n1. 创建 package.json（name: hello-world, version: 1.0.0, type: module）\n2. 创建 index.js，导出一个函数 greet(name)，返回 \"Hello, {name}!\"\n3. 创建 index.test.js，使用 Node.js 内置 test runner（node:test）测试 greet 函数，至少包含 3 个测试用例\n4. 验收标准：运行 node --test 全部通过"
+      "title": "搭建 Python 计算器项目结构",
+      "prompt": "在 calculator/ 目录下创建一个 Python 计算器项目：\n1. 创建 calculator/__init__.py\n2. 创建 calculator/core.py，实现 Calculator 类，支持 add, subtract, multiply, divide 四个方法，每个方法接受两个数字参数并返回结果。divide 需要处理除零错误，抛出 ValueError。\n3. 创建 calculator/history.py，实现 History 类，用列表记录每次计算的表达式和结果，支持 add_record(expression, result)、get_all()、clear() 方法。\n4. 所有代码需要有类型注解。"
+    },
+    {
+      "id": "task-002",
+      "title": "为计算器编写单元测试",
+      "prompt": "在 calculator/ 目录下创建测试文件：\n1. 创建 tests/__init__.py\n2. 创建 tests/test_core.py，使用 pytest 为 Calculator 类编写测试，覆盖：加减乘除的正常情况、负数运算、浮点数运算、除零错误。至少 10 个测试用例。\n3. 创建 tests/test_history.py，测试 History 类的 add_record、get_all、clear 方法。至少 5 个测试用例。\n4. 创建 pytest.ini 配置文件。\n5. 运行 pytest -v 确认全部通过。"
+    },
+    {
+      "id": "task-003",
+      "title": "实现命令行交互界面",
+      "prompt": "在 calculator/ 目录下创建 cli.py，实现交互式命令行计算器：\n1. 启动后打印欢迎信息和使用说明\n2. 支持输入格式：数字 运算符 数字（如 3 + 5）\n3. 支持运算符：+  -  *  /\n4. 输入 history 查看历史记录\n5. 输入 clear 清除历史\n6. 输入 quit 或 exit 退出\n7. 输入无效时给出友好提示，不崩溃\n8. 使用 calculator.core 和 calculator.history 模块\n9. 添加 if __name__ == '__main__' 入口"
+    },
+    {
+      "id": "task-004",
+      "title": "添加高级数学运算扩展",
+      "prompt": "在 calculator/ 目录下扩展计算器功能：\n1. 创建 calculator/advanced.py，实现 AdvancedCalculator 类，继承 Calculator，新增方法：power(base, exp) 幂运算、sqrt(n) 开方（负数抛 ValueError）、modulo(a, b) 取余（b为0抛 ValueError）\n2. 在 tests/ 下创建 tests/test_advanced.py，为所有新方法编写测试，包括边界情况和错误处理，至少 8 个测试用例\n3. 更新 cli.py 使其支持新运算符：** (幂)、sqrt、% (取余)\n4. 运行 pytest -v 确认所有测试通过"
+    },
+    {
+      "id": "task-005",
+      "title": "生成项目文档和使用报告",
+      "prompt": "在 calculator/ 目录下完成项目收尾：\n1. 创建 README.md，包含：项目简介、功能列表、安装方式、使用示例（含代码块）、项目结构树\n2. 运行 pytest -v --tb=short，将完整输出保存到 test_report.txt\n3. 创建 requirements.txt，列出项目依赖\n4. 用 python -c 验证：from calculator.core import Calculator; from calculator.advanced import AdvancedCalculator; from calculator.history import History; print('All imports OK')"
     }
   ]
 }

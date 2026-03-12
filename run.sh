@@ -13,6 +13,22 @@ REPORT_FILE="$SCRIPT_DIR/report.json"
 PROJECTS_DIR="$SCRIPT_DIR/projects"
 LOGS_DIR="$SCRIPT_DIR/logs"
 
+# Ensure Claude CLI can find git-bash on Windows
+if [[ -z "${CLAUDE_CODE_GIT_BASH_PATH:-}" ]]; then
+  # Try common locations (Unix path style for bash)
+  for candidate in \
+    "/c/Program Files/Git/bin/bash.exe" \
+    "/c/Program Files (x86)/Git/bin/bash.exe" \
+    "/e/Git/bin/bash.exe"; do
+    if [[ -f "$candidate" ]]; then
+      # Claude CLI needs Windows-style path
+      export CLAUDE_CODE_GIT_BASH_PATH
+      CLAUDE_CODE_GIT_BASH_PATH=$(cygpath -w "$candidate")
+      break
+    fi
+  done
+fi
+
 DRY_RUN=false
 if [[ "${1:-}" == "--dry-run" ]]; then
   DRY_RUN=true
@@ -119,6 +135,19 @@ read_config() {
 # ------------------------------------------------------------------------------
 get_completed_ids() {
   jq -r '[.[] | select(.status == "success") | .task_id] | unique | .[]' "$REPORT_FILE" 2>/dev/null || true
+}
+
+# ------------------------------------------------------------------------------
+# Check if a task has exhausted all retries (no success, attempts >= max_retries)
+# ------------------------------------------------------------------------------
+is_task_exhausted() {
+  local task_id="$1"
+  local attempts
+  attempts=$(get_attempt_count "$task_id")
+  if [[ $attempts -ge $MAX_RETRIES ]]; then
+    return 0
+  fi
+  return 1
 }
 
 # ------------------------------------------------------------------------------
@@ -236,15 +265,14 @@ execute_task() {
       local prompt_tmp="$SCRIPT_DIR/.prompt.tmp"
       printf '%s' "$task_prompt" > "$prompt_tmp"
 
-      # Execute claude in projects/ directory
+      # Execute claude in projects/ directory (tee to both terminal and log file)
       set +e
       timeout "$TIMEOUT_SECONDS" claude -p "$(cat "$prompt_tmp")" \
-        --output-format json \
         --dangerously-skip-permissions \
         --max-budget-usd "$MAX_BUDGET_USD" \
         --no-session-persistence \
-        > "$output_file" 2>&1 <<< ""
-      exit_code=$?
+        2>&1 <<< "" | tee "$output_file"
+      exit_code=${PIPESTATUS[0]}
       set -e
 
       # Clean up temp file
@@ -344,6 +372,12 @@ main() {
       # Check if this task is already completed
       if echo "$completed_ids" | grep -qx "$task_id" 2>/dev/null; then
         log "Skipping completed task: $task_id"
+        continue
+      fi
+
+      # Check if retries exhausted for this task
+      if is_task_exhausted "$task_id"; then
+        log "Skipping exhausted task: $task_id (attempts >= $MAX_RETRIES)"
         continue
       fi
 
