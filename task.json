@@ -1,0 +1,15 @@
+{
+  "version": "1.0.0",
+  "config": {
+    "max_retries": 2,
+    "timeout_seconds": 300,
+    "max_budget_usd": 1.0
+  },
+  "tasks": [
+    {
+      "id": "task-001",
+      "title": "创建 hello-world 示例项目",
+      "prompt": "在 hello-world/ 目录下创建一个 Node.js 项目：\n1. 创建 package.json（name: hello-world, version: 1.0.0, type: module）\n2. 创建 index.js，导出一个函数 greet(name)，返回 \"Hello, {name}!\"\n3. 创建 index.test.js，使用 Node.js 内置 test runner（node:test）测试 greet 函数，至少包含 3 个测试用例\n4. 验收标准：运行 node --test 全部通过"
+    }
+  ]
+}
