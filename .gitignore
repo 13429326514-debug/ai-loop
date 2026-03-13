@@ -2,4 +2,6 @@ logs/
 projects/
 .prompt.tmp
 *.tmp
+summary.md
+report.json
 .idea/

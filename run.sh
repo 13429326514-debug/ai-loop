@@ -31,11 +31,13 @@ fi
 
 DRY_RUN=false
 INTERACTIVE=false
+SKIP_PUSH=false
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --dry-run)      DRY_RUN=true ;;
     --interactive)  INTERACTIVE=true ;;
+    --skip-push)    SKIP_PUSH=true ;;
   esac
   shift
 done
@@ -67,6 +69,7 @@ init() {
   log "Script dir: $SCRIPT_DIR"
   log "Dry-run mode: $DRY_RUN"
   log "Interactive mode: $INTERACTIVE"
+  log "Skip push: $SKIP_PUSH"
 
   # Check jq
   if ! command -v jq &>/dev/null; then
@@ -134,6 +137,7 @@ read_config() {
   TIMEOUT_SECONDS=$(jq -r '.config.timeout_seconds // 300' "$TASK_FILE")
   MAX_BUDGET_USD=$(jq -r '.config.max_budget_usd // 1.0' "$TASK_FILE")
   PROJECT_NAME=$(jq -r '.project_name // ""' "$TASK_FILE")
+  SYSTEM_PROMPT=$(jq -r '.system_prompt // ""' "$TASK_FILE")
 
   if [[ -z "$PROJECT_NAME" ]]; then
     log_error "project_name is required in task.json"
@@ -143,6 +147,9 @@ read_config() {
   PROJECT_DIR="$PROJECTS_DIR/$PROJECT_NAME"
   log "Config: max_retries=$MAX_RETRIES, timeout=${TIMEOUT_SECONDS}s, budget=\$${MAX_BUDGET_USD}"
   log "Project: $PROJECT_NAME"
+  if [[ -n "$SYSTEM_PROMPT" ]]; then
+    log "System prompt: $(echo "$SYSTEM_PROMPT" | head -c 80)..."
+  fi
 }
 
 # ------------------------------------------------------------------------------
@@ -168,8 +175,17 @@ init_git_repo() {
 
   # Check gh CLI
   if ! command -v gh &>/dev/null; then
-    log_error "gh (GitHub CLI) is not installed. Required for creating remote repos."
-    exit 1
+    log "WARNING: ⚠ gh (GitHub CLI) not found. Running in local-git-only mode (no push)."
+    SKIP_PUSH=true
+    # Still init local git
+    mkdir -p "$PROJECT_DIR"
+    cd "$PROJECT_DIR"
+    if [[ ! -d ".git" ]]; then
+      git init
+      log "Local git repo initialized in $PROJECT_DIR (no remote)"
+    fi
+    cd "$SCRIPT_DIR"
+    return 0
   fi
 
   # Get GitHub username
@@ -234,6 +250,12 @@ git_commit_and_push() {
   log "Committed: feat($task_id): $task_title"
 
   # Push (create main branch on first push if needed)
+  if [[ "$SKIP_PUSH" == true ]]; then
+    log "Push skipped (--skip-push or no remote configured)"
+    cd "$SCRIPT_DIR"
+    return 0
+  fi
+
   local current_branch
   current_branch=$(git branch --show-current 2>/dev/null || echo "main")
   if [[ -z "$current_branch" ]]; then
@@ -242,8 +264,10 @@ git_commit_and_push() {
   fi
 
   git push -u origin "$current_branch" 2>&1 || {
-    log "Push failed, retrying..."
-    git push --set-upstream origin "$current_branch" 2>&1
+    log "WARNING: ⚠ Push failed for $task_id. Changes are committed locally but NOT pushed to remote."
+    log "WARNING: ⚠ You may need to push manually: cd $PROJECT_DIR && git push"
+    cd "$SCRIPT_DIR"
+    return 0
   }
   log "Pushed to origin/$current_branch"
 
@@ -262,9 +286,10 @@ get_completed_ids() {
 # ------------------------------------------------------------------------------
 is_task_exhausted() {
   local task_id="$1"
+  local task_max_retries="${2:-$MAX_RETRIES}"
   local attempts
   attempts=$(get_attempt_count "$task_id")
-  if [[ $attempts -ge $MAX_RETRIES ]]; then
+  if [[ $attempts -ge $task_max_retries ]]; then
     return 0
   fi
   return 1
@@ -349,22 +374,72 @@ append_report() {
 }
 
 # ------------------------------------------------------------------------------
+# Generate CLAUDE.md in the project directory for context
+# ------------------------------------------------------------------------------
+generate_project_claude_md() {
+  local task_id="$1"
+  local task_title="$2"
+  local claude_md="$PROJECT_DIR/CLAUDE.md"
+
+  mkdir -p "$PROJECT_DIR"
+
+  {
+    echo "# CLAUDE.md"
+    echo ""
+    echo "Project: $PROJECT_NAME"
+    echo "Current task: $task_id - $task_title"
+    echo ""
+    if [[ -n "$SYSTEM_PROMPT" ]]; then
+      echo "## Development Guidelines"
+      echo ""
+      echo "$SYSTEM_PROMPT"
+      echo ""
+    fi
+    echo "## Completed Tasks"
+    echo ""
+    if [[ -f "$REPORT_FILE" ]]; then
+      local completed
+      completed=$(jq -r '.[] | select(.status == "success") | "- \(.task_id): \(.task_title)"' "$REPORT_FILE" 2>/dev/null || true)
+      if [[ -n "$completed" ]]; then
+        echo "$completed"
+      else
+        echo "(none yet)"
+      fi
+    else
+      echo "(none yet)"
+    fi
+  } > "$claude_md"
+
+  log "Generated CLAUDE.md for $task_id in $PROJECT_DIR"
+}
+
+# ------------------------------------------------------------------------------
 # Execute a single task with retries
 # ------------------------------------------------------------------------------
 execute_task() {
   local task_id="$1"
   local task_title="$2"
   local task_prompt="$3"
+  local task_timeout="${4:-$TIMEOUT_SECONDS}"
+  local task_budget="${5:-$MAX_BUDGET_USD}"
+  local task_retries="${6:-$MAX_RETRIES}"
 
   local existing_attempts
   existing_attempts=$(get_attempt_count "$task_id")
 
   log "--- Executing task: $task_id ($task_title) ---"
   log "Previous attempts: $existing_attempts"
+  log "Task config: timeout=${task_timeout}s, budget=\$${task_budget}, retries=$task_retries"
+
+  # Append system_prompt to task prompt if configured
+  local full_prompt="$task_prompt"
+  if [[ -n "$SYSTEM_PROMPT" ]]; then
+    full_prompt="${task_prompt}\n\n--- System Instructions ---\n${SYSTEM_PROMPT}"
+  fi
 
   local attempt
-  for (( attempt = existing_attempts + 1; attempt <= existing_attempts + MAX_RETRIES; attempt++ )); do
-    log "Attempt $attempt / $((existing_attempts + MAX_RETRIES)) for $task_id"
+  for (( attempt = existing_attempts + 1; attempt <= existing_attempts + task_retries; attempt++ )); do
+    log "Attempt $attempt / $((existing_attempts + task_retries)) for $task_id"
 
     local started_at
     started_at=$(date -Iseconds)
@@ -377,13 +452,14 @@ execute_task() {
     if [[ "$DRY_RUN" == true ]]; then
       # Dry-run: simulate execution
       log "[DRY-RUN] Would execute claude with prompt for $task_id"
-      log "[DRY-RUN] Prompt (first 100 chars): ${task_prompt:0:100}..."
+      log "[DRY-RUN] Prompt (first 100 chars): ${full_prompt:0:100}..."
+      log "[DRY-RUN] Timeout: ${task_timeout}s, Budget: \$${task_budget}"
       echo '{"dry_run": true}' > "$output_file"
       exit_code=0
     else
       # Write prompt to temp file to avoid shell escaping issues
       local prompt_tmp="$SCRIPT_DIR/.prompt.tmp"
-      printf '%s' "$task_prompt" > "$prompt_tmp"
+      printf '%b' "$full_prompt" > "$prompt_tmp"
 
       if [[ "$INTERACTIVE" == true ]]; then
         # Interactive mode: open native Claude Code session
@@ -399,15 +475,15 @@ execute_task() {
         set +e
         claude --init-prompt "$(cat "$prompt_tmp")" \
           --dangerously-skip-permissions \
-          --max-budget-usd "$MAX_BUDGET_USD"
+          --max-budget-usd "$task_budget"
         exit_code=$?
         set -e
       else
         # Auto mode: non-interactive execution (tee to both terminal and log file)
         set +e
-        timeout "$TIMEOUT_SECONDS" claude -p "$(cat "$prompt_tmp")" \
+        timeout "$task_timeout" claude -p "$(cat "$prompt_tmp")" \
           --dangerously-skip-permissions \
-          --max-budget-usd "$MAX_BUDGET_USD" \
+          --max-budget-usd "$task_budget" \
           --no-session-persistence \
           2>&1 <<< "" | tee "$output_file"
         exit_code=${PIPESTATUS[0]}
@@ -433,7 +509,7 @@ execute_task() {
       log "Task $task_id succeeded (attempt $attempt, ${duration}s)"
     elif [[ $exit_code -eq 124 ]]; then
       status="timeout"
-      error_message="Timed out after ${TIMEOUT_SECONDS}s"
+      error_message="Timed out after ${task_timeout}s"
       log "Task $task_id timed out (attempt $attempt, ${duration}s)"
     else
       status="failure"
@@ -450,10 +526,13 @@ execute_task() {
       return 0
     fi
 
-    # If not the last attempt, wait before retry
-    if [[ $attempt -lt $((existing_attempts + MAX_RETRIES)) ]]; then
-      log "Waiting 5s before retry..."
-      sleep 5
+    # If not the last attempt, wait with exponential backoff
+    if [[ $attempt -lt $((existing_attempts + task_retries)) ]]; then
+      local retry_num=$(( attempt - existing_attempts ))
+      local wait_time=$(( 5 * (1 << (retry_num - 1)) ))
+      if [[ $wait_time -gt 60 ]]; then wait_time=60; fi
+      log "Waiting ${wait_time}s before retry (exponential backoff)..."
+      sleep "$wait_time"
     fi
   done
 
@@ -480,6 +559,42 @@ print_summary() {
 
   log "Tasks: $completed_tasks / $task_total completed"
   log "Records: $total total ($success success, $failure failure, $timeout_count timeout)"
+
+  # Per-task status table
+  log ""
+  log "Task Details:"
+  log "  ID          | Status   | Attempts | Duration"
+  log "  ------------|----------|----------|--------"
+
+  local summary_md="$SCRIPT_DIR/summary.md"
+  {
+    echo "# Execution Summary"
+    echo ""
+    echo "- Project: $PROJECT_NAME"
+    echo "- Date: $(date '+%Y-%m-%d %H:%M:%S')"
+    echo "- Tasks: $completed_tasks / $task_total completed"
+    echo "- Records: $total total ($success success, $failure failure, $timeout_count timeout)"
+    echo ""
+    echo "## Task Details"
+    echo ""
+    echo "| ID | Title | Status | Attempts | Duration |"
+    echo "|---|---|---|---|---|"
+  } > "$summary_md"
+
+  for (( i = 0; i < task_total; i++ )); do
+    local tid ttl tst att dur
+    tid=$(jq -r ".tasks[$i].id" "$TASK_FILE")
+    ttl=$(jq -r ".tasks[$i].title" "$TASK_FILE")
+    tst=$(jq -r --arg id "$tid" '[.[] | select(.task_id == $id)] | last | .status // "pending"' "$REPORT_FILE")
+    att=$(jq -r --arg id "$tid" '[.[] | select(.task_id == $id)] | length' "$REPORT_FILE")
+    dur=$(jq -r --arg id "$tid" '[.[] | select(.task_id == $id)] | last | .duration_seconds // 0' "$REPORT_FILE")
+
+    log "  $tid | $tst | $att | ${dur}s"
+    echo "| $tid | $ttl | $tst | $att | ${dur}s |" >> "$summary_md"
+  done
+
+  log ""
+  log "Summary saved to: $summary_md"
   log "Report: $REPORT_FILE"
   log "Logs: $LOGS_DIR"
   log "=== Done ==="
@@ -509,6 +624,12 @@ main() {
       local task_id
       task_id=$(jq -r ".tasks[$i].id" "$TASK_FILE")
 
+      # Read task-level config overrides (fallback to global)
+      local task_timeout task_budget task_retries
+      task_timeout=$(jq -r ".tasks[$i].timeout_seconds // $TIMEOUT_SECONDS" "$TASK_FILE")
+      task_budget=$(jq -r ".tasks[$i].max_budget_usd // $MAX_BUDGET_USD" "$TASK_FILE")
+      task_retries=$(jq -r ".tasks[$i].max_retries // $MAX_RETRIES" "$TASK_FILE")
+
       # Check if this task is already completed
       if echo "$completed_ids" | grep -qx "$task_id" 2>/dev/null; then
         log "Skipping completed task: $task_id"
@@ -516,8 +637,8 @@ main() {
       fi
 
       # Check if retries exhausted for this task
-      if is_task_exhausted "$task_id"; then
-        log "Skipping exhausted task: $task_id (attempts >= $MAX_RETRIES)"
+      if is_task_exhausted "$task_id" "$task_retries"; then
+        log "Skipping exhausted task: $task_id (attempts >= $task_retries)"
         continue
       fi
 
@@ -528,13 +649,16 @@ main() {
 
       found=true
 
+      # Generate project CLAUDE.md for context
+      generate_project_claude_md "$task_id" "$task_title"
+
       # Execute the task (failures don't stop the loop)
       local task_result=0
       if [[ "$DRY_RUN" == true ]]; then
-        execute_task "$task_id" "$task_title" "$task_prompt" || task_result=$?
+        execute_task "$task_id" "$task_title" "$task_prompt" "$task_timeout" "$task_budget" "$task_retries" || task_result=$?
       else
         cd "$PROJECT_DIR"
-        execute_task "$task_id" "$task_title" "$task_prompt" || task_result=$?
+        execute_task "$task_id" "$task_title" "$task_prompt" "$task_timeout" "$task_budget" "$task_retries" || task_result=$?
         cd "$SCRIPT_DIR"
       fi
 
